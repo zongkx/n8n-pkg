@@ -1,0 +1,58 @@
+name: Build n8n Windows EXE
+
+on:
+  workflow_dispatch: # 支持手动触发构建
+    inputs:
+      n8n_version:
+        description: '想要打包的 n8n 版本 (例如: 1.45.0, 或者输入 latest)'
+        required: true
+        default: 'latest'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20 # 使用稳定的 Node 20 环境
+
+    - name: Install n8n and pkg
+      run: |
+        # 根据输入版本安装指定或最新版的 n8n 以及打包工具 pkg
+        if [ "${{ github.event.inputs.n8n_version }}" = "latest" ]; then
+          npm install -g n8n pkg
+        else
+          npm install -g n8n@${{ github.event.inputs.n8n_version }} pkg
+        fi
+
+    - name: Prepare pkg Entry Point
+      run: |
+        # 找到全局安装的 n8n 路径
+        N8N_PATH=$(npm root -g)/n8n
+        echo "n8n 全局路径: $N8N_PATH"
+        
+        # 创建一个干净的打包工作目录
+        mkdir -p ./dist
+        cp -r $N8N_PATH/* ./dist/
+        
+        # 在 dist 目录中生成一个临时的 package.json 引导配置，告诉 pkg 包含哪些动态文件
+        cd ./dist
+        cat <<< "$(jq '. + {"pkg": {"assets": ["dist/**/*", "nodes/**/*", "templates/**/*"]}}' package.json)" > package.json
+
+    - name: Run pkg Build
+      run: |
+        cd ./dist
+        # 执行打包，目标系统为 Windows x64，对应 Node 20 运行时
+        # --no-bytecode 避免部分原生模块由于字节码导致加载失败
+        pkg . --targets node20-win-x64 --no-bytecode --output ../n8n-windows.exe
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: n8n-windows-exe
+        path: n8n-windows.exe
