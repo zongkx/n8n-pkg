@@ -37,7 +37,7 @@ jobs:
         Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -Type DWord -Force
       shell: powershell
 
-    # 1. 准备扁平化运行环境：Node 便携版 + n8n 依赖 (已整合 isolated-vm 避坑逻辑)
+    # 1. 准备扁平化运行环境：Node 便携版 + n8n 依赖（已整合 isolated-vm 避坑逻辑）
     - name: Prep n8n Source & Runtime
       run: |
         New-Item -ItemType Directory -Force -Path .\build_dir\runtime
@@ -48,15 +48,10 @@ jobs:
         Expand-Archive -Path node-win.zip -DestinationPath .\node_temp
         Copy-Item -Path ".\node_temp\node-v$NODE_VER-win-x64\*" -Destination ".\build_dir\runtime" -Recurse -Force
         
-        # B. 🌟 核心修复：配置 npm 并强行拉取官方 win32-x64 预编译二进制，阻止 node-gyp 本地编译
+        # B. 安装 n8n 生产依赖，完全跳过所有安装脚本（阻止 node-gyp）
         cd build_dir
         npm init -y
-        
-        # 升级全局 node-gyp 提高高版本 V8 的包树兼容性
-        npm install -g node-gyp@latest
-        
-        # 增加金牌令箭：禁止从源码构建，若无预编译包则直接报错，防止卡死或引发 gyp ERR!
-        npm install n8n@${{ github.event.inputs.n8n_version }} --omit=dev --legacy-peer-deps --build-from-source=false --fallback-to-build=false
+        npm install n8n@${{ github.event.inputs.n8n_version }} --omit=dev --legacy-peer-deps --ignore-scripts
       shell: powershell
 
     # 2. 将整个运行环境打包为 app.zip
