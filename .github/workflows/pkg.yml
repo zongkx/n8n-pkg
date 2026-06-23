@@ -25,13 +25,19 @@ jobs:
       with:
         node-version: ${{ github.event.inputs.node_version }}
 
-    # 🌟 显式引入 Go 编译环境，确保云端具备 go build 和 go:embed 能力
     - name: Setup Go Environment
       uses: actions/setup-go@v5
       with:
         go-version: 'stable'
 
-    # 1. 整理扁平化目录结构 (直接在 build_dir 下放置 runtime 和 node_modules)
+    # 启用 Windows 长路径支持，防止 npm install 因路径过长失败
+    - name: Enable Long Paths Support
+      run: |
+        git config --system core.longpaths true
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -Type DWord -Force
+      shell: powershell
+
+    # 1. 准备扁平化运行环境：Node 便携版 + n8n 依赖 (已整合 isolated-vm 避坑逻辑)
     - name: Prep n8n Source & Runtime
       run: |
         New-Item -ItemType Directory -Force -Path .\build_dir\runtime
@@ -42,20 +48,25 @@ jobs:
         Expand-Archive -Path node-win.zip -DestinationPath .\node_temp
         Copy-Item -Path ".\node_temp\node-v$NODE_VER-win-x64\*" -Destination ".\build_dir\runtime" -Recurse -Force
         
-        # B. 原生 Windows 本地直接创建全局/局部混合环境，拉取整个 node_modules
+        # B. 🌟 核心修复：配置 npm 并强行拉取官方 win32-x64 预编译二进制，阻止 node-gyp 本地编译
         cd build_dir
         npm init -y
-        npm install n8n@${{ github.event.inputs.n8n_version }} --omit=dev
+        
+        # 升级全局 node-gyp 提高高版本 V8 的包树兼容性
+        npm install -g node-gyp@latest
+        
+        # 增加金牌令箭：禁止从源码构建，若无预编译包则直接报错，防止卡死或引发 gyp ERR!
+        npm install n8n@${{ github.event.inputs.n8n_version }} --omit=dev --legacy-peer-deps --build-from-source=false --fallback-to-build=false
       shell: powershell
 
-    # 2. 🌟 放弃 7z，直接使用 PowerShell 原生压缩命令生成 app.zip
+    # 2. 将整个运行环境打包为 app.zip
     - name: Compress into app.zip
       run: |
         cd build_dir
         Compress-Archive -Path .\* -DestinationPath ..\app.zip -CompressionLevel Optimal
       shell: powershell
 
-    # 3. 编写更优雅、完全对齐路径的 Go 启动器源码
+    # 3. 编写智能启动器 Go 源码（内嵌 app.zip）
     - name: Write Smart Launcher (Go)
       run: |
         $GoCode = @'
@@ -69,7 +80,6 @@ jobs:
             "path/filepath"
         )
 
-        // 🌟 静态内嵌原生 app.zip
         //go:embed app.zip
         var appZip []byte
 
@@ -77,18 +87,17 @@ jobs:
 
         func main() {
             localAppData := os.Getenv("LOCALAPPDATA")
-            // 缓存释放至 LOCALAPPDATA\n8n-portable\v2.26.8
             targetDir := filepath.Join(localAppData, "n8n-portable", "v"+version)
             exeMarker := filepath.Join(targetDir, "runtime", "node.exe")
 
-            // 🔍 检查：如果 node.exe 存在，说明非首次运行，直接闪电启动
+            // 非首次运行：直接启动
             if _, err := os.Stat(exeMarker); err == nil {
                 fmt.Println("检测到本地缓存已存在，正在闪电启动 n8n v" + version + "...")
                 launchN8n(targetDir)
                 return
             }
 
-            // 📥 首次运行：创建缓存目录并释放内嵌的 zip 资源
+            // 首次运行：解压内嵌资源到 LOCALAPPDATA
             fmt.Println("第一次运行，正在初始化运行环境，请稍候（仅限首次）...")
             os.MkdirAll(targetDir, os.ModePerm)
 
@@ -100,7 +109,6 @@ jobs:
             }
 
             fmt.Println("正在释放全量依赖至 LocalAppData (约 300~500MB)...")
-            // 调用 Windows 物理机百分之百具备的 PowerShell 核心解压指令，成功率 100%
             psCmd := fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", archivePath, targetDir)
             cmd := exec.Command("powershell", "-Command", psCmd)
             if err := cmd.Run(); err != nil {
@@ -108,15 +116,11 @@ jobs:
                 return
             }
 
-            // 清理缓存区残余的 zip 文件
             os.Remove(archivePath)
-            
-            // 闪电拉起
             launchN8n(targetDir)
         }
 
         func launchN8n(baseDir string) {
-            // 🌟 严格对应精简扁平化后的绝对路径
             nodeExe := filepath.Join(baseDir, "runtime", "node.exe")
             n8nScript := filepath.Join(baseDir, "node_modules", "n8n", "bin", "n8n")
 
@@ -133,10 +137,10 @@ jobs:
         $GoCode | Out-File -FilePath .\main.go -Encoding utf8
       shell: powershell
 
-    # 4. 编译 Go 源码，生成真正的单文件二进制
-    - name: Compile Native Launcher
+    # 4. 初始化 Go 模块并编译为单文件二进制
+    - name: Init Go Module & Compile Native Launcher
       run: |
-        # -s -w 压缩 go 二进制自身体积
+        go mod init launcher
         go build -ldflags="-s -w" -o launcher.exe main.go
       shell: powershell
 
