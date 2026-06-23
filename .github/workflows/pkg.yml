@@ -1,4 +1,4 @@
-name: Build n8n Windows EXE (2.x Fixed)
+name: Build n8n Smart Launcher (ZIP + AppData Cache)
 
 on:
   workflow_dispatch:
@@ -8,58 +8,141 @@ on:
         required: true
         default: '2.26.8'
       node_version:
-        description: 'Node 运行版本 (推荐 20)'
+        description: 'Windows Node 运行版本 (推荐 20.15.0)'
         required: true
-        default: '20'
+        default: '20.15.0'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
-    - name: Checkout Repository
+    - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Setup Node.js
+    - name: Setup Node.js Environment
       uses: actions/setup-node@v4
       with:
         node-version: ${{ github.event.inputs.node_version }}
 
-    - name: Download and Prepare n8n Source
-      run: |
-        # 1. 直接安装指定版本的 n8n
-        npm install -g n8n@${{ github.event.inputs.n8n_version }}
-        
-        # 2. 找到提取路径并移入工作区
-        N8N_PATH=$(npm root -g)/n8n
-        mkdir -p ./dist
-        cp -r $N8N_PATH/* ./dist/
-        
-        # 3. 动态重写 package.json 声明静态资源路径
-        cd ./dist
-        jq '. + {
-          "pkg": {
-            "assets": [
-              "dist/**/*",
-              "nodes/**/*",
-              "templates/**/*",
-              "node_modules/**/*"
-            ]
-          }
-        }' package.json > package.tmp.json && mv package.tmp.json package.json
+    # 🌟 显式引入 Go 编译环境，确保云端具备 go build 和 go:embed 能力
+    - name: Setup Go Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
 
-    - name: Compiling Windows Executable
+    # 1. 整理扁平化目录结构 (直接在 build_dir 下放置 runtime 和 node_modules)
+    - name: Prep n8n Source & Runtime
       run: |
-        cd ./dist
-        # 🌟 关键改动：直接使用 npx pkg，npm 会自动拉取官方最新且正确的打包器
-        # 加上 --no-bytecode 强行绕过 V8 字节码对小版本号的挑剔
-        npx pkg . \
-          --targets node${{ github.event.inputs.node_version }}-win-x64 \
-          --no-bytecode \
-          --output ../n8n-v${{ github.event.inputs.n8n_version }}-windows.exe
+        New-Item -ItemType Directory -Force -Path .\build_dir\runtime
+        
+        # A. 下载并解压 Windows Portable Node
+        $NODE_VER = "${{ github.event.inputs.node_version }}"
+        Invoke-WebRequest -Uri "https://nodejs.org/dist/v$NODE_VER/node-v$NODE_VER-win-x64.zip" -OutFile node-win.zip
+        Expand-Archive -Path node-win.zip -DestinationPath .\node_temp
+        Copy-Item -Path ".\node_temp\node-v$NODE_VER-win-x64\*" -Destination ".\build_dir\runtime" -Recurse -Force
+        
+        # B. 原生 Windows 本地直接创建全局/局部混合环境，拉取整个 node_modules
+        cd build_dir
+        npm init -y
+        npm install n8n@${{ github.event.inputs.n8n_version }} --omit=dev
+      shell: powershell
 
-    - name: Upload Finished EXE
+    # 2. 🌟 放弃 7z，直接使用 PowerShell 原生压缩命令生成 app.zip
+    - name: Compress into app.zip
+      run: |
+        cd build_dir
+        Compress-Archive -Path .\* -DestinationPath ..\app.zip -CompressionLevel Optimal
+      shell: powershell
+
+    # 3. 编写更优雅、完全对齐路径的 Go 启动器源码
+    - name: Write Smart Launcher (Go)
+      run: |
+        $GoCode = @'
+        package main
+
+        import (
+            _ "embed"
+            "fmt"
+            "os"
+            "os/exec"
+            "path/filepath"
+        )
+
+        // 🌟 静态内嵌原生 app.zip
+        //go:embed app.zip
+        var appZip []byte
+
+        const version = "${{ github.event.inputs.n8n_version }}"
+
+        func main() {
+            localAppData := os.Getenv("LOCALAPPDATA")
+            // 缓存释放至 LOCALAPPDATA\n8n-portable\v2.26.8
+            targetDir := filepath.Join(localAppData, "n8n-portable", "v"+version)
+            exeMarker := filepath.Join(targetDir, "runtime", "node.exe")
+
+            // 🔍 检查：如果 node.exe 存在，说明非首次运行，直接闪电启动
+            if _, err := os.Stat(exeMarker); err == nil {
+                fmt.Println("检测到本地缓存已存在，正在闪电启动 n8n v" + version + "...")
+                launchN8n(targetDir)
+                return
+            }
+
+            // 📥 首次运行：创建缓存目录并释放内嵌的 zip 资源
+            fmt.Println("第一次运行，正在初始化运行环境，请稍候（仅限首次）...")
+            os.MkdirAll(targetDir, os.ModePerm)
+
+            archivePath := filepath.Join(targetDir, "app.zip")
+            err := os.WriteFile(archivePath, appZip, 0644)
+            if err != nil {
+                fmt.Printf("释放资源失败: %v\n", err)
+                return
+            }
+
+            fmt.Println("正在释放全量依赖至 LocalAppData (约 300~500MB)...")
+            // 调用 Windows 物理机百分之百具备的 PowerShell 核心解压指令，成功率 100%
+            psCmd := fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", archivePath, targetDir)
+            cmd := exec.Command("powershell", "-Command", psCmd)
+            if err := cmd.Run(); err != nil {
+                fmt.Printf("解压运行环境失败: %v\n", err)
+                return
+            }
+
+            // 清理缓存区残余的 zip 文件
+            os.Remove(archivePath)
+            
+            // 闪电拉起
+            launchN8n(targetDir)
+        }
+
+        func launchN8n(baseDir string) {
+            // 🌟 严格对应精简扁平化后的绝对路径
+            nodeExe := filepath.Join(baseDir, "runtime", "node.exe")
+            n8nScript := filepath.Join(baseDir, "node_modules", "n8n", "bin", "n8n")
+
+            cmd := exec.Command(nodeExe, n8nScript, "start")
+            cmd.Stdout = os.Stdout
+            cmd.Stderr = os.Stderr
+            cmd.Stdin = os.Stdin
+
+            if err := cmd.Run(); err != nil {
+                fmt.Printf("n8n 服务异常退出: %v\n", err)
+            }
+        }
+        '@
+        $GoCode | Out-File -FilePath .\main.go -Encoding utf8
+      shell: powershell
+
+    # 4. 编译 Go 源码，生成真正的单文件二进制
+    - name: Compile Native Launcher
+      run: |
+        # -s -w 压缩 go 二进制自身体积
+        go build -ldflags="-s -w" -o launcher.exe main.go
+      shell: powershell
+
+    # 5. 上传最终产物
+    - name: Upload Smarter Launcher
       uses: actions/upload-artifact@v4
       with:
-        name: n8n-windows-executable
-        path: n8n-v${{ github.event.inputs.n8n_version }}-windows.exe
+        name: n8n-smart-launcher
+        path: launcher.exe
