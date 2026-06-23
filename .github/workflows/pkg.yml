@@ -1,14 +1,14 @@
-name: Build n8n Windows EXE (2.x Compliant)
+name: Build n8n Windows EXE (2.x Fixed)
 
 on:
   workflow_dispatch:
     inputs:
       n8n_version:
-        description: 'n8n 版本 (例如: 2.26.8, 或填最新稳定版 1.123.60)'
+        description: 'n8n 版本 (例如: 2.26.8)'
         required: true
         default: '2.26.8'
       node_version:
-        description: 'Node 运行版本 (2.x大版本必须填 20)'
+        description: 'Node 运行版本 (推荐 20)'
         required: true
         default: '20'
 
@@ -25,14 +25,9 @@ jobs:
       with:
         node-version: ${{ github.event.inputs.node_version }}
 
-    - name: Install Latest Packaging Tools
-      run: |
-        # 使用最新的 @vercel/pkg，并直接在本地注入当前容器的 node 依赖项
-        npm install -g @vercel/pkg jq
-
     - name: Download and Prepare n8n Source
       run: |
-        # 1. 干净地全局拉取指定版本的 n8n
+        # 1. 直接安装指定版本的 n8n
         npm install -g n8n@${{ github.event.inputs.n8n_version }}
         
         # 2. 找到提取路径并移入工作区
@@ -40,7 +35,7 @@ jobs:
         mkdir -p ./dist
         cp -r $N8N_PATH/* ./dist/
         
-        # 3. 动态重写 package.json 声明，强制覆盖 pkg 的静态资源加载路径
+        # 3. 动态重写 package.json 声明静态资源路径
         cd ./dist
         jq '. + {
           "pkg": {
@@ -56,8 +51,8 @@ jobs:
     - name: Compiling Windows Executable
       run: |
         cd ./dist
-        # 使用 npx 强行指定准确的目标架构 node${{ github.event.inputs.node_version }}-windows-x64
-        # 加上 --no-bytecode 避免 V8 引擎在不同微版本号（如 20.11 和 20.18）下的字节码崩溃
+        # 🌟 关键改动：直接使用 npx pkg，npm 会自动拉取官方最新且正确的打包器
+        # 加上 --no-bytecode 强行绕过 V8 字节码对小版本号的挑剔
         npx pkg . \
           --targets node${{ github.event.inputs.node_version }}-win-x64 \
           --no-bytecode \
