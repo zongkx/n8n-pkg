@@ -1,14 +1,14 @@
-name: Build n8n Windows EXE (Strict Version)
+name: Build n8n Windows EXE (2.x Compliant)
 
 on:
   workflow_dispatch:
     inputs:
       n8n_version:
-        description: 'n8n 版本 (建议填具体版本号，如 1.45.0)'
+        description: 'n8n 版本 (例如: 2.26.8, 或填最新稳定版 1.123.60)'
         required: true
-        default: '1.45.0'
+        default: '2.26.8'
       node_version:
-        description: '严格指定匹配的 Node 版本 (推荐 20)'
+        description: 'Node 运行版本 (2.x大版本必须填 20)'
         required: true
         default: '20'
 
@@ -25,27 +25,46 @@ jobs:
       with:
         node-version: ${{ github.event.inputs.node_version }}
 
-    - name: Install n8n and New pkg
+    - name: Install Latest Packaging Tools
       run: |
-        # 🌟 关键改动：安装 @vercel/pkg 代替老旧的 pkg
-        npm install -g n8n@${{ github.event.inputs.n8n_version }} @vercel/pkg
+        # 使用最新的 @vercel/pkg，并直接在本地注入当前容器的 node 依赖项
+        npm install -g @vercel/pkg jq
 
-    - name: Prepare pkg Entry Point
+    - name: Download and Prepare n8n Source
       run: |
+        # 1. 干净地全局拉取指定版本的 n8n
+        npm install -g n8n@${{ github.event.inputs.n8n_version }}
+        
+        # 2. 找到提取路径并移入工作区
         N8N_PATH=$(npm root -g)/n8n
         mkdir -p ./dist
         cp -r $N8N_PATH/* ./dist/
+        
+        # 3. 动态重写 package.json 声明，强制覆盖 pkg 的静态资源加载路径
         cd ./dist
-        cat <<< "$(jq '. + {"pkg": {"assets": ["dist/**/*", "nodes/**/*", "templates/**/*"]}}' package.json)" > package.json
+        jq '. + {
+          "pkg": {
+            "assets": [
+              "dist/**/*",
+              "nodes/**/*",
+              "templates/**/*",
+              "node_modules/**/*"
+            ]
+          }
+        }' package.json > package.tmp.json && mv package.tmp.json package.json
 
-    - name: Run pkg Build
+    - name: Compiling Windows Executable
       run: |
         cd ./dist
-        # 🌟 关键改动：使用 npx pkg 调用新版命令，并强制跳过字节码
-        npx pkg . --targets node${{ github.event.inputs.node_version }}-win-x64 --no-bytecode --output ../n8n-windows-${{ github.event.inputs.n8n_version }}.exe
+        # 使用 npx 强行指定准确的目标架构 node${{ github.event.inputs.node_version }}-windows-x64
+        # 加上 --no-bytecode 避免 V8 引擎在不同微版本号（如 20.11 和 20.18）下的字节码崩溃
+        npx pkg . \
+          --targets node${{ github.event.inputs.node_version }}-win-x64 \
+          --no-bytecode \
+          --output ../n8n-v${{ github.event.inputs.n8n_version }}-windows.exe
 
-    - name: Upload Artifact
+    - name: Upload Finished EXE
       uses: actions/upload-artifact@v4
       with:
-        name: n8n-windows-exe
-        path: n8n-windows-${{ github.event.inputs.n8n_version }}.exe
+        name: n8n-windows-executable
+        path: n8n-v${{ github.event.inputs.n8n_version }}-windows.exe
